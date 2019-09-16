@@ -5,11 +5,15 @@
 
 package com.vmware.connectors.concur;
 
+import com.nimbusds.jose.util.StandardCharset;
+import com.vmware.connectors.common.json.JsonDocument;
 import com.vmware.connectors.common.payloads.response.*;
 import com.vmware.connectors.common.utils.AuthUtil;
 import com.vmware.connectors.common.utils.CardTextAccessor;
 import com.vmware.connectors.common.web.UserException;
 import com.vmware.connectors.concur.domain.*;
+import com.vmware.connectors.concur.exception.AttachmentURLNotFoundException;
+import com.vmware.connectors.concur.exception.InvalidServiceAccountCredentialException;
 import org.apache.commons.io.IOUtils;
 import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
@@ -17,15 +21,21 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.io.Resource;
+import org.springframework.core.io.buffer.DataBuffer;
+import org.springframework.core.io.buffer.DefaultDataBufferFactory;
 import org.springframework.http.HttpMethod;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.util.CollectionUtils;
-import org.springframework.web.bind.annotation.PathVariable;
-import org.springframework.web.bind.annotation.PostMapping;
-import org.springframework.web.bind.annotation.RequestHeader;
-import org.springframework.web.bind.annotation.RestController;
+import org.springframework.util.LinkedMultiValueMap;
+import org.springframework.util.MultiValueMap;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.reactive.function.BodyInserters;
+import org.springframework.web.reactive.function.client.ClientResponse;
 import org.springframework.web.reactive.function.client.WebClient;
+import org.springframework.web.reactive.function.client.WebClientResponseException;
 import org.springframework.web.util.HtmlUtils;
+import org.springframework.web.util.UriComponentsBuilder;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
@@ -36,12 +46,16 @@ import java.text.NumberFormat;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.stream.Collectors;
 
-import static org.springframework.http.HttpHeaders.AUTHORIZATION;
+import static com.vmware.connectors.common.utils.CommonUtils.BACKEND_STATUS;
+import static org.springframework.http.HttpHeaders.*;
+import static org.springframework.http.HttpStatus.*;
 import static org.springframework.http.MediaType.*;
 
 @RestController
+@SuppressWarnings("PMD.CouplingBetweenObjects")
 public class HubConcurController {
 
     private static final Logger logger = LoggerFactory.getLogger(HubConcurController.class);
@@ -56,22 +70,36 @@ public class HubConcurController {
 
     private static final String CONNECTOR_AUTH = "X-Connector-Authorization";
 
+    private static final String ATTACHMENT_URL = "%sapi/expense/report/%s/attachment";
+
+    private static final String CLIENT_ID = "client_id";
+    private static final String CLIENT_SECRET = "client_secret";
+    private static final String USERNAME = "username";
+    private static final String PASSWORD = "password";
+    private static final String GRANT_TYPE = "grant_type";
+    private static final String BEARER = "Bearer ";
+    private static final String CONTENT_DISPOSITION_FORMAT = "Content-Disposition: inline; filename=\"%s.pdf\"";
+    private static final int AUTH_VALUES_COUNT = 4;
+
     private final WebClient rest;
     private final CardTextAccessor cardTextAccessor;
     private final Resource concurRequestTemplate;
     private final String serviceAccountAuthHeader;
+    private final String oauthTokenUrl;
 
     @Autowired
     public HubConcurController(
             WebClient rest,
             CardTextAccessor cardTextAccessor,
             @Value("classpath:static/templates/concur-request-template.xml") Resource concurRequestTemplate,
-            @Value("${concur.service-account-auth-header:}") String serviceAccountAuthHeader
+            @Value("${concur.service-account-auth-header:}") String serviceAccountAuthHeader,
+            @Value("${concur.oauth-instance-url}") String oauthTokenUrl
     ) {
         this.rest = rest;
         this.cardTextAccessor = cardTextAccessor;
         this.concurRequestTemplate = concurRequestTemplate;
         this.serviceAccountAuthHeader = serviceAccountAuthHeader;
+        this.oauthTokenUrl = oauthTokenUrl;
     }
 
     @PostMapping(
@@ -93,8 +121,64 @@ public class HubConcurController {
             return Mono.just(ResponseEntity.badRequest().build());
         }
 
-        return fetchCards(baseUrl, locale, routingPrefix, userEmail, getAuthHeader(connectorAuth))
-                .map(ResponseEntity::ok);
+        return getAuthHeader(connectorAuth)
+                .flatMap(authHeader -> fetchCards(baseUrl, locale, routingPrefix, userEmail, authHeader)
+                        .map(ResponseEntity::ok));
+    }
+
+    private Mono<String> getAuthHeader(final String auth) {
+        final String connectorAuth = getServiceAccountCredential(auth);
+        final String[] authValues = connectorAuth.split(":");
+
+        // Service account credential format - username:password:client-id:client-secret
+        if (authValues.length != AUTH_VALUES_COUNT) {
+            throw new InvalidServiceAccountCredentialException("Service account credential is invalid.");
+        }
+
+        final String username = authValues[0];
+        final String password = authValues[1];
+        final String clientId = authValues[2];
+        final String clientSecret = authValues[3];
+
+        final MultiValueMap<String, String> body = getBody(username, password, clientId, clientSecret);
+
+        return rest.post()
+                .uri(UriComponentsBuilder.fromUriString(oauthTokenUrl).path("/oauth2/v0/token").toUriString())
+                .header(ACCEPT, APPLICATION_JSON_VALUE)
+                .body(BodyInserters.fromFormData(body))
+                .retrieve()
+                .bodyToMono(JsonDocument.class)
+                .map(jsonDocument -> BEARER + jsonDocument.read("$.access_token"))
+                .onErrorMap(WebClientResponseException.class, e -> handleForbiddenException(e));
+    }
+
+    public Throwable handleForbiddenException(WebClientResponseException e) {
+        // We have to convert the exception to return UNAUTHORIZED(401), since concur returns FORBIDDEN(403) for invalid credentials.
+        if (HttpStatus.FORBIDDEN.equals(e.getStatusCode())) {
+            return new WebClientResponseException(
+                    e.getMessage(),
+                    HttpStatus.UNAUTHORIZED.value(),
+                    e.getStatusText(),
+                    e.getHeaders(),
+                    e.getResponseBodyAsByteArray(),
+                    StandardCharset.UTF_8);
+        }
+        return e;
+    }
+
+    private MultiValueMap<String, String> getBody(final String username,
+                                                  final String password,
+                                                  final String clientId,
+                                                  final String clientSecret) {
+        final MultiValueMap<String, String> body = new LinkedMultiValueMap<>();
+
+        body.put(CLIENT_ID, List.of(clientId));
+        body.put(CLIENT_SECRET, List.of(clientSecret));
+        body.put(USERNAME, List.of(username));
+        body.put(PASSWORD, List.of(password));
+        body.put(GRANT_TYPE, List.of(PASSWORD));
+
+        return body;
     }
 
     private boolean isServiceAccountCredentialEmpty(final String connectorAuth) {
@@ -106,7 +190,7 @@ public class HubConcurController {
         }
     }
 
-    private String getAuthHeader(final String connectorAuth) {
+    private String getServiceAccountCredential(final String connectorAuth) {
         if (StringUtils.isBlank(this.serviceAccountAuthHeader)) {
             return connectorAuth;
         } else {
@@ -191,7 +275,7 @@ public class HubConcurController {
         Card.Builder builder = new Card.Builder()
                 .setName("Concur")
                 .setHeader(cardTextAccessor.getMessage("hub.concur.header", locale, reportName))
-                .setBody(buildCard(locale, report))
+                .setBody(buildCard(locale, report, routingPrefix))
                 .setBackendId(report.getReportID())
                 .addAction(makeAction(routingPrefix, locale, reportId,
                         true, "hub.concur.approve", COMMENT_KEY, "hub.concur.approve.comment.label", "/approve"))
@@ -204,7 +288,8 @@ public class HubConcurController {
     }
 
     private CardBody buildCard(final Locale locale,
-                               final ExpenseReportResponse report) {
+                               final ExpenseReportResponse report,
+                               final String routingPrefix) {
         final CardBody.Builder cardBodyBuilder =  new CardBody.Builder()
                 .addField(makeGeneralField(locale, "hub.concur.report.name", report.getReportName()))
                 .addField(makeGeneralField(locale, "hub.concur.requester", report.getEmployeeName()))
@@ -212,12 +297,17 @@ public class HubConcurController {
                         formatCurrency(report.getReportTotal(), locale, report.getCurrencyCode())));
 
         if (!CollectionUtils.isEmpty(report.getExpenseEntriesList())) {
-            buildExpenseItemsList(report, locale).forEach(cardBodyBuilder::addField);
+            buildExpenseItems(report, locale).forEach(cardBodyBuilder::addField);
+
+            // Add expense report attachment URL.
+            if (StringUtils.isNotBlank(report.getReportImageURL())) {
+                cardBodyBuilder.addField(buildAttachmentURL(routingPrefix, report.getReportID(), locale));
+            }
         }
         return cardBodyBuilder.build();
     }
 
-    private List<CardBodyField> buildExpenseItemsList(final ExpenseReportResponse report, final Locale locale) {
+    private List<CardBodyField> buildExpenseItems(final ExpenseReportResponse report, final Locale locale) {
         return report.getExpenseEntriesList()
                 .stream()
                 .map(entry -> new CardBodyField.Builder()
@@ -229,21 +319,34 @@ public class HubConcurController {
                 .collect(Collectors.toList());
     }
 
-    private List<CardBodyFieldItem> buildItems(Locale locale, ExpenseEntriesVO expenseEntry) {
+    private List<CardBodyFieldItem> buildItems(final Locale locale, final ExpenseEntriesVO expenseEntry) {
         final List<CardBodyFieldItem> items = new ArrayList<>();
-        items.add(makeCardBodyFieldItem(cardTextAccessor.getMessage("hub.concur.expense.type.name", locale), expenseEntry.getExpenseTypeName()));
-        items.add(makeCardBodyFieldItem(cardTextAccessor.getMessage("hub.concur.transaction.date", locale),  expenseEntry.getTransactionDate()));
-        items.add(makeCardBodyFieldItem(cardTextAccessor.getMessage("hub.concur.vendor.name", locale), expenseEntry.getVendorDescription()));
-        items.add(makeCardBodyFieldItem(cardTextAccessor.getMessage("hub.concur.city.of.purchase", locale), expenseEntry.getLocationName()));
-        items.add(makeCardBodyFieldItem(cardTextAccessor.getMessage("hub.concur.payment.type", locale), expenseEntry.getPaymentTypeCode()));
-        items.add(makeCardBodyFieldItem(cardTextAccessor.getMessage("hub.concur.amount", locale),
-                formatCurrency(expenseEntry.getPostedAmount(), locale, expenseEntry.getTransactionCurrencyName())));
+
+        addItem("hub.concur.expense.type.name", expenseEntry.getExpenseTypeName(), locale, items);
+        addItem("hub.concur.transaction.date", expenseEntry.getTransactionDate(), locale, items);
+        addItem("hub.concur.vendor.name", expenseEntry.getVendorDescription(), locale, items);
+        addItem("hub.concur.city.of.purchase", expenseEntry.getLocationName(), locale, items);
+        addItem("hub.concur.payment.type", expenseEntry.getPaymentTypeCode(), locale, items);
+        addItem("hub.concur.amount", formatCurrency(expenseEntry.getPostedAmount(),
+                locale, expenseEntry.getTransactionCurrencyName()), locale, items);
 
         final List<String> attendeesList = expenseEntry.getAttendeesList();
         if (!CollectionUtils.isEmpty(attendeesList)) {
             items.add(makeCardBodyFieldItem(cardTextAccessor.getMessage("hub.concur.attendees", locale), attendeesList.toString()));
         }
+
         return items;
+    }
+
+    private void addItem(final String title,
+                         final String description,
+                         final Locale locale,
+                         final List<CardBodyFieldItem> items) {
+        if (StringUtils.isBlank(description)) {
+            return;
+        }
+
+        items.add(makeCardBodyFieldItem(cardTextAccessor.getMessage(title, locale), description));
     }
 
     private CardBodyFieldItem makeCardBodyFieldItem(final String title, final String description) {
@@ -259,6 +362,10 @@ public class HubConcurController {
             String labelKey,
             String value
     ) {
+        if (StringUtils.isBlank(value)) {
+            return null;
+        }
+
         return new CardBodyField.Builder()
                 .setType(CardBodyFieldType.GENERAL)
                 .setTitle(cardTextAccessor.getMessage(labelKey, locale))
@@ -305,6 +412,24 @@ public class HubConcurController {
                 .build();
     }
 
+    private CardBodyField buildAttachmentURL(final String routingPrefix,
+                                             final String reportID,
+                                             final Locale locale) {
+        CardBodyField.Builder builder = new CardBodyField.Builder()
+                .setTitle(cardTextAccessor.getMessage("hub.concur.attachment", locale))
+                .setType(CardBodyFieldType.SECTION)
+                .addItem(new CardBodyFieldItem.Builder()
+                        .setAttachmentName(reportID)
+                        .setTitle(cardTextAccessor.getMessage("hub.concur.report.image.url", locale))
+                        .setAttachmentMethod(HttpMethod.GET)
+                        .setAttachmentUrl(String.format(ATTACHMENT_URL, routingPrefix, reportID))
+                        .setType(CardBodyFieldType.ATTACHMENT_URL)
+                        .setAttachmentContentType(APPLICATION_PDF_VALUE) // Concur always returns a PDF file. It consolidates all the attachments into a single PDF file.
+                        .build());
+
+        return builder.build();
+    }
+
     private Cards addCard(
             Cards cards,
             Card card
@@ -324,7 +449,7 @@ public class HubConcurController {
             @RequestHeader(name = CONNECTOR_AUTH, required = false) String connectorAuth,
             @PathVariable("id") String id,
             @Valid CommentForm form
-            ) {
+    ) {
         logger.debug("approveRequest called: baseUrl={},  id={}, comment={}", baseUrl, id, form.getComment());
 
         if (isServiceAccountCredentialEmpty(connectorAuth)) {
@@ -332,8 +457,9 @@ public class HubConcurController {
         }
 
         String userEmail = AuthUtil.extractUserEmail(authorization);
-        return makeConcurRequest(form.getComment(), baseUrl, APPROVE, id, userEmail, getAuthHeader(connectorAuth))
-                .map(ResponseEntity::ok);
+        return getAuthHeader(connectorAuth)
+                .flatMap(authHeader -> makeConcurRequest(form.getComment(), baseUrl, APPROVE, id, userEmail, authHeader)
+                        .map(ResponseEntity::ok));
     }
 
     private Mono<String> makeConcurRequest(
@@ -380,12 +506,12 @@ public class HubConcurController {
     private Mono<?> validateUser(
             String baseUrl,
             String reportId,
-            String userEmail,
+            String loginID,
             String connectorAuth
     ) {
-        return fetchAllApprovals(baseUrl, userEmail, connectorAuth)
+        return fetchAllApprovals(baseUrl, loginID, connectorAuth)
                 .filter(expense -> expense.getId().equals(reportId))
-                .filter(expense -> expense.getApproverLoginID().equals(userEmail))
+                .filter(expense -> expense.getApproverLoginID().equals(loginID))
                 .next()
                 .switchIfEmpty(Mono.error(new UserException("Not Found"))); // CustomException
     }
@@ -409,8 +535,86 @@ public class HubConcurController {
         }
 
         String userEmail = AuthUtil.extractUserEmail(authorization);
-        return makeConcurRequest(form.getReason(), baseUrl, REJECT, id, userEmail, getAuthHeader(connectorAuth))
-                .map(ResponseEntity::ok);
+        return getAuthHeader(connectorAuth)
+                .flatMap(authHeader -> makeConcurRequest(form.getReason(), baseUrl, REJECT, id, userEmail, authHeader)
+                        .map(ResponseEntity::ok));
     }
 
+    @GetMapping(
+            path = "api/expense/report/{id}/attachment"
+    )
+    public Mono<ResponseEntity<Flux<DataBuffer>>> fetchAttachment(
+            @RequestHeader(AUTHORIZATION) String authorization,
+            @RequestHeader(X_BASE_URL_HEADER) String baseUrl,
+            @RequestHeader(CONNECTOR_AUTH) String connectorAuth,
+            @PathVariable("id") String reportId
+    ) {
+        final String userEmail = AuthUtil.extractUserEmail(authorization);
+        logger.debug("fetchAttachment called: baseUrl={}, userEmail={}, reportId={}", baseUrl, userEmail, reportId);
+
+        return getAuthHeader(connectorAuth)
+                .flatMap(authHeader -> fetchLoginIdFromUserEmail(userEmail, baseUrl, authHeader)
+                        .flatMap(loginID -> validateUser(baseUrl, reportId, loginID, authHeader))
+                        .then(fetchRequestData(baseUrl, reportId, authHeader))
+                        .flatMap(expenseReportResponse -> getAttachment(expenseReportResponse, authHeader))
+                        .map(clientResponse -> handleClientResponse(clientResponse, reportId)));
+    }
+
+    private Mono<ClientResponse> getAttachment(ExpenseReportResponse report, String connectorAuth) {
+        if (StringUtils.isBlank(report.getReportImageURL())) {
+            throw new AttachmentURLNotFoundException("Concur expense report with ID " + report.getReportID() + " does not have any attachments.");
+        }
+
+        return this.rest.get()
+                .uri(report.getReportImageURL())
+                .header(AUTHORIZATION, connectorAuth)
+                .exchange();
+    }
+
+    private ResponseEntity<Flux<DataBuffer>> handleClientResponse(final ClientResponse response, final String reportId) {
+        if (response.statusCode().is2xxSuccessful()) {
+            return ResponseEntity.ok()
+                    .contentType(response.headers().contentType().orElse(APPLICATION_PDF))
+                    .header(CONTENT_DISPOSITION, String.format(CONTENT_DISPOSITION_FORMAT, reportId))
+                    .body(response.bodyToFlux(DataBuffer.class));
+
+        }
+
+        return handleErrorStatus(response);
+    }
+
+    private ResponseEntity<Flux<DataBuffer>> handleErrorStatus(final ClientResponse response) {
+        final HttpStatus status = response.statusCode();
+        final String backendStatus = Integer.toString(response.rawStatusCode());
+
+        logger.error("Concur backend returned the status code [{}] and reason phrase [{}] ", status, status.getReasonPhrase());
+
+        if (status == UNAUTHORIZED) {
+            String body = "{\"error\" : \"invalid_connector_token\"}";
+            final DataBuffer dataBuffer = new DefaultDataBufferFactory().wrap(body.getBytes(StandardCharset.UTF_8));
+            return ResponseEntity.status(BAD_REQUEST)
+                    .header(BACKEND_STATUS, backendStatus)
+                    .contentType(APPLICATION_JSON)
+                    .body(Flux.just(dataBuffer));
+        } else {
+            final ResponseEntity.BodyBuilder builder = ResponseEntity.status(INTERNAL_SERVER_ERROR).header(BACKEND_STATUS, backendStatus);
+            response.headers().contentType().ifPresent(builder::contentType);
+            return builder.body(response.bodyToFlux(DataBuffer.class));
+        }
+    }
+
+    @ExceptionHandler(AttachmentURLNotFoundException.class)
+    @ResponseStatus(NOT_FOUND)
+    @ResponseBody
+    public Map<String, String> handleAttachmentURLNotFoundException(AttachmentURLNotFoundException e) {
+        return Map.of("message", e.getMessage());
+    }
+
+    @ExceptionHandler(InvalidServiceAccountCredentialException.class)
+    @ResponseBody
+    public ResponseEntity<Map<String, String>> handleInvalidServiceAccountCredentialException(InvalidServiceAccountCredentialException e) {
+        return ResponseEntity.status(BAD_REQUEST)
+                .header(BACKEND_STATUS, Integer.toString(UNAUTHORIZED.value()))
+                .body(Map.of("message", e.getMessage()));
+    }
 }

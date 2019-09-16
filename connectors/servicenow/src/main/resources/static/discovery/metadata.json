@@ -20,74 +20,10 @@
         "href": "${CONNECTOR_HOST}/cards/requests"
       }
     },
-    "catalog": {
-      "fields": {
-        "type": {
-          "env": "ITEM_TYPE"
-        },
-        "catalog": {
-          "env": "CATALOG_NAME"
-        },
-        "category": {
-          "env": "CATEGORY_NAME"
-        },
-        "context_id": {
-          "env": "CONTEXT_ID",
-          "required": false
-        }
-      },
+    "botDiscovery": {
       "endpoint": {
-        "href": "${CONNECTOR_HOST}/api/v1/catalog-items"
+        "href": "${CONNECTOR_HOST}/bot-discovery"
       }
-    },
-    "task": {
-      "fields": {
-        "type": {
-          "env": "TASK_TYPE",
-          "required": false
-        },
-        "number": {
-          "env": "TASK_NUMBER",
-          "required": false
-        },
-        "context_id": {
-          "env": "CONTEXT_ID",
-          "required": false
-        }
-      },
-      "endpoint": {
-        "href": "${CONNECTOR_HOST}/api/v1/tasks"
-      }
-    },
-    "cart": {
-      "fields": {
-        "context_id": {
-          "env": "CONTEXT_ID",
-          "required": false
-        }
-      },
-      "endpoint": {
-        "href": "${CONNECTOR_HOST}/api/v1/cart"
-      }
-    }
-  },
-  "actions": {
-    "create_task": {
-      "url": {
-        "href": "${CONNECTOR_HOST}/api/v1/task/create"
-      },
-      "user_input": [],
-      "request": {
-        "type": {
-          "env": "TASK_TYPE"
-        },
-        "short_description": {
-          "env": "TASK_SHORT_DESCRIPTION"
-        }
-      },
-      "label": "Create Task",
-      "type": "POST",
-      "action_key": "USER_INPUT"
     }
   }
 }

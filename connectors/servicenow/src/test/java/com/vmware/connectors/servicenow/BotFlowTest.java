@@ -27,6 +27,7 @@ import java.util.stream.Collectors;
 import static com.vmware.connectors.utils.IgnoredFieldsReplacer.*;
 import static com.vmware.connectors.utils.IgnoredFieldsReplacer.DUMMY_UUID;
 import static org.hamcrest.MatcherAssert.assertThat;
+import static com.jayway.restassured.module.jsv.JsonSchemaValidator.matchesJsonSchema;
 import static org.springframework.http.HttpHeaders.ACCEPT_LANGUAGE;
 import static org.springframework.http.HttpHeaders.AUTHORIZATION;
 import static org.springframework.http.HttpMethod.GET;
@@ -48,6 +49,7 @@ class BotFlowTest extends ControllerTestsBase {
     private static final String OBJ_TYPE_CATALOG_ITEM = "catalog";
     private static final String OBJ_TYPE_TASK = "task";
     private static final String OBJ_TYPE_CART = "cart";
+    private static final String OBJ_TYPE_CREATE_TASK = "createTask";
 
     @ParameterizedTest
     @ValueSource(strings = {
@@ -79,19 +81,19 @@ class BotFlowTest extends ControllerTestsBase {
 
         // Find out the id of the category requested.
         String catalogId = "e0d08b13c3330100c8b837659bba8fb4";
-        mockBackend.expect(requestToUriTemplate("/api/sn_sc/servicecatalog/catalogs/{catalogId}/categories", catalogId))
+        mockBackend.expect(requestToUriTemplate("/api/sn_sc/servicecatalog/catalogs/{catalogId}", catalogId))
                 .andExpect(header(AUTHORIZATION, "Bearer " + SNOW_AUTH_TOKEN))
                 .andExpect(method(GET))
-                .andRespond(withSuccess(fromFile("/botflows/servicenow/response/service_catalog_categories.json"), APPLICATION_JSON));
+                .andRespond(withSuccess(fromFile("/botflows/servicenow/response/service_catalog.json"), APPLICATION_JSON));
 
         // Find out available items of type 'laptop' within 'hardware' category.
-        String type = "laptop";
+        String searchText = "laptop";
         String categoryId = "d258b953c611227a0146101fb1be7c31";
         mockBackend.expect(requestToUriTemplate("/api/sn_sc/servicecatalog/items" +
-                "?sysparm_text={type}" +
+                "?sysparm_text={searchText}" +
                         "&sysparm_category={categoryId}" +
                         "&sysparm_limit=10&sysparm_offset=0",
-                type, categoryId))
+                searchText, categoryId))
                 .andExpect(header(AUTHORIZATION, "Bearer " + SNOW_AUTH_TOKEN))
                 .andExpect(method(GET))
                 .andRespond(withSuccess(fromFile("/botflows/servicenow/response/laptop_items.json"), APPLICATION_JSON));
@@ -104,6 +106,7 @@ class BotFlowTest extends ControllerTestsBase {
                 .getResponseBody()
                 .collect(Collectors.joining())
                 .map(BotFlowTest::normalizeBotObjects)
+                .map(json -> json.replaceAll(mockBackend.url("/"), "https://mock-snow.com/"))
                 .block();
 
         assertThat(body, sameJSONAs(fromFile("/botflows/connector/response/laptop_items.json")).allowingAnyArrayOrdering());
@@ -118,10 +121,10 @@ class BotFlowTest extends ControllerTestsBase {
                 .andRespond(withSuccess(fromFile("/botflows/servicenow/response/catalogs.json"), APPLICATION_JSON));
 
         String catalogId = "e0d08b13c3330100c8b837659bba8fb4";
-        mockBackend.expect(requestToUriTemplate("/api/sn_sc/servicecatalog/catalogs/{catalogId}/categories", catalogId))
+        mockBackend.expect(requestToUriTemplate("/api/sn_sc/servicecatalog/catalogs/{catalogId}", catalogId))
                 .andExpect(header(AUTHORIZATION, "Bearer " + SNOW_AUTH_TOKEN))
                 .andExpect(method(GET))
-                .andRespond(withSuccess(fromFile("/botflows/servicenow/response/service_catalog_categories.json"), APPLICATION_JSON));
+                .andRespond(withSuccess(fromFile("/botflows/servicenow/response/service_catalog.json"), APPLICATION_JSON));
 
 
         requestObjects("/api/v1/catalog-items", SNOW_AUTH_TOKEN, "/botflows/connector/request/fruits.json",
@@ -166,13 +169,37 @@ class BotFlowTest extends ControllerTestsBase {
                 .getResponseBody()
                 .collect(Collectors.joining())
                 .map(BotFlowTest::normalizeBotObjects)
+                .map(json -> json.replaceAll(mockBackend.url("/"), "https://mock-snow.com/"))
                 .block();
 
         assertThat(body, sameJSONAs(fromFile(expectedCartFileName)).allowingAnyArrayOrdering());
     }
 
     @Test
-    void testCreateTask() throws IOException {
+    void testBotDiscoveryObject() throws Exception {
+
+        // APF-2473 - Adds support for multi-tenant params. CardRequest will contain "config" at that time.
+        String body = requestObjects("/bot-discovery", SNOW_AUTH_TOKEN,
+                "/botflows/connector/request/bot_discovery_object.json",
+                OBJ_TYPE_CREATE_TASK, null)
+                .expectStatus().is2xxSuccessful()
+                .returnResult(String.class)
+                .getResponseBody()
+                .collect(Collectors.joining())
+                .map(BotFlowTest::normalizeBotObjects)
+                .block();
+
+        assertThat(body, sameJSONAs(fromFile("/botflows/connector/response/bot_discovery_object.json")).allowingAnyArrayOrdering());
+
+        Object botDiscoveryObj = JsonPath.parse(body).read("$.objects[0]");
+        String botDiscoveryJsonString = JsonPath.parse(botDiscoveryObj).jsonString();
+
+        assertThat(botDiscoveryJsonString, 	matchesJsonSchema(fromFile("/bot-schema.json")));
+
+    }
+
+    @Test
+    void testCreateTaskAction() throws IOException {
         String taskType = "ticket";
         mockBackend.expect(requestToUriTemplate("/api/now/table/{taskType}", taskType))
                 .andExpect(header(AUTHORIZATION, "Bearer " + SNOW_AUTH_TOKEN))
@@ -187,7 +214,7 @@ class BotFlowTest extends ControllerTestsBase {
 
         MultiValueMap<String, String> actionFormData = new LinkedMultiValueMap<>();
         actionFormData.set("type", taskType);
-        actionFormData.set("short_description", "My mouse is not working.");
+        actionFormData.set("shortDescription", "My mouse is not working.");
 
         String body = performAction(POST, "/api/v1/task/create", SNOW_AUTH_TOKEN, actionFormData)
                 .expectStatus().is2xxSuccessful()
@@ -217,8 +244,8 @@ class BotFlowTest extends ControllerTestsBase {
 
 
         MultiValueMap<String, String> actionFormData = new LinkedMultiValueMap<>();
-        actionFormData.set("item_id", itemId);
-        actionFormData.set("item_count", String.valueOf(itemCount));
+        actionFormData.set("itemId", itemId);
+        actionFormData.set("itemCount", String.valueOf(itemCount));
 
         String body = performAction(PUT, "/api/v1/cart", SNOW_AUTH_TOKEN, actionFormData)
                 .expectStatus().is2xxSuccessful()
@@ -226,6 +253,7 @@ class BotFlowTest extends ControllerTestsBase {
                 .getResponseBody()
                 .collect(Collectors.joining())
                 .map(BotFlowTest::normalizeBotObjects)
+                .map(json -> json.replaceAll(mockBackend.url("/"), "https://mock-snow.com/"))
                 .block();
 
         assertThat(body, sameJSONAs(fromFile("/botflows/connector/response/add_mac_to_cart.json")).allowingAnyArrayOrdering());
@@ -249,6 +277,7 @@ class BotFlowTest extends ControllerTestsBase {
                 .getResponseBody()
                 .collect(Collectors.joining())
                 .map(BotFlowTest::normalizeBotObjects)
+                .map(json -> json.replaceAll(mockBackend.url("/"), "https://mock-snow.com/"))
                 .block();
 
         assertThat(body, sameJSONAs(fromFile("/botflows/connector/response/delete_mouse_from_cart.json")).allowingAnyArrayOrdering());
@@ -308,12 +337,11 @@ class BotFlowTest extends ControllerTestsBase {
                                                      String sNowAuthToken, MultiValueMap<String, String> formData) {
         WebTestClient.RequestBodySpec requestSpec = webClient.method(method)
                 .uri(actionPath)
-                .header(AUTHORIZATION, "Bearer " + accessToken())
                 .accept(APPLICATION_JSON)
                 .header(X_BASE_URL_HEADER, mockBackend.url(""))
                 .header(X_AUTH_HEADER, "Bearer " + sNowAuthToken)
                 .header("x-routing-template", "https://mf/connectors/abc123/INSERT_OBJECT_TYPE/")
-                .headers(ControllerTestsBase::headers);
+                .headers(headers -> headers(headers, actionPath));
 
         if (formData != null) {
             requestSpec.contentType(APPLICATION_FORM_URLENCODED)
@@ -346,13 +374,12 @@ class BotFlowTest extends ControllerTestsBase {
 
         WebTestClient.RequestHeadersSpec<?> spec = webClient.post()
                 .uri(path)
-                .header(AUTHORIZATION, "Bearer " + accessToken())
                 .contentType(contentType)
                 .accept(APPLICATION_JSON)
                 .header(X_BASE_URL_HEADER, mockBackend.url(""))
                 .header(X_AUTH_HEADER, "Bearer " + authToken)
                 .header("x-routing-prefix", String.format("https://mf/connectors/abc123/%s/", objectType))
-                .headers(ControllerTestsBase::headers)
+                .headers(headers -> headers(headers, path))
                 .syncBody(fromFile(requestFile));
 
         if (StringUtils.isNotBlank(language)) {
@@ -362,13 +389,15 @@ class BotFlowTest extends ControllerTestsBase {
         return spec.exchange();
     }
 
-    public static String normalizeBotObjects(String body) {
+    private static String normalizeBotObjects(String body) {
         Configuration configuration = Configuration.builder()
                 .jsonProvider(new JacksonJsonNodeJsonProvider())
                 .build();
 
         DocumentContext context = JsonPath.using(configuration).parse(body);
         context.set("$.objects[?(@.id =~ /" + UUID_PATTERN + "/)].id", DUMMY_UUID);
+        // Above line can be removed, when all the bot flows move to the latest schema.
+        context.set("$.objects[*].itemDetails[?(@.id =~ /" + UUID_PATTERN + "/)].id", DUMMY_UUID);
         context.set("$.objects[*].children[?(@.id =~ /" + UUID_PATTERN + "/)].id", DUMMY_UUID);
         return context.jsonString();
     }
