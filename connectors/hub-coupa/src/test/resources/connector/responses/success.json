@@ -6,7 +6,9 @@
             "creation_date": "1970-01-01T00:00:00Z",
             "header": {
                 "title": "[Coupa] AppBuilder Q1 PO",
-                "subtitle": []
+                "links": {
+                    "title": "${COUPA_URL}requisition_headers/182964"
+                }
             },
             "body": {
                 "fields": [
@@ -78,6 +80,36 @@
                                 "type": "GENERAL",
                                 "title": "Billing account",
                                 "description": "B-SG-IN"
+                            }
+                        ]
+                    },
+                    {
+                        "type": "SECTION",
+                        "title": "Attachments",
+                        "items": [
+                            {
+                                "type": "ATTACHMENT_URL",
+                                "title": "Click here to download the attachment",
+                                "attachment_name": "response.png",
+                                "attachment_content_type": "image/png",
+                                "attachment_url": "https://hero/connectors/coupa/api/user/15882/182964/attachment/response.png/2701685",
+                                "attachment_method": "GET"
+                            },
+                            {
+                                "type": "ATTACHMENT_URL",
+                                "title": "Click here to download the attachment",
+                                "attachment_name": "timestamp.pdf",
+                                "attachment_content_type": "application/pdf",
+                                "attachment_url": "https://hero/connectors/coupa/api/user/15882/182964/attachment/timestamp.pdf/2701686",
+                                "attachment_method": "GET"
+                            },
+                            {
+                                "type": "ATTACHMENT_URL",
+                                "title": "Click here to download the attachment",
+                                "attachment_name": "comments.jpg",
+                                "attachment_url": "image/jpeg",
+                                "attachment_url": "https://hero/connectors/coupa/api/user/15882/182964/attachment/comments.jpg/2701687",
+                                "attachment_method": "GET"
                             }
                         ]
                     }
