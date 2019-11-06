@@ -10,10 +10,10 @@ import com.vmware.connectors.common.json.JsonDocument;
 import com.vmware.connectors.common.payloads.response.*;
 import com.vmware.connectors.common.utils.AuthUtil;
 import com.vmware.connectors.common.utils.CardTextAccessor;
-import com.vmware.connectors.common.web.UserException;
 import com.vmware.connectors.concur.domain.*;
 import com.vmware.connectors.concur.exception.AttachmentURLNotFoundException;
 import com.vmware.connectors.concur.exception.InvalidServiceAccountCredentialException;
+import com.vmware.connectors.concur.exception.UserNotFoundException;
 import org.apache.commons.io.IOUtils;
 import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
@@ -23,6 +23,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.io.Resource;
 import org.springframework.core.io.buffer.DataBuffer;
 import org.springframework.core.io.buffer.DefaultDataBufferFactory;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -151,17 +152,26 @@ public class HubConcurController {
     }
 
     public Throwable handleForbiddenException(WebClientResponseException e) {
-        // We have to convert the exception to return UNAUTHORIZED(401), since concur returns FORBIDDEN(403) for invalid credentials.
+        // Concur returns 403 when the auth params are invalid. We have to convert the exception to return BAD REQUEST(400) with X-Backend-Status as 401.
         if (HttpStatus.FORBIDDEN.equals(e.getStatusCode())) {
+            final HttpHeaders headers = copyHeaders(e.getHeaders().toSingleValueMap());
+            headers.set(BACKEND_STATUS, String.valueOf(UNAUTHORIZED.value()));
+
             return new WebClientResponseException(
                     e.getMessage(),
-                    HttpStatus.UNAUTHORIZED.value(),
+                    UNAUTHORIZED.value(),
                     e.getStatusText(),
-                    e.getHeaders(),
+                    headers,
                     e.getResponseBodyAsByteArray(),
                     StandardCharset.UTF_8);
         }
         return e;
+    }
+
+    private HttpHeaders copyHeaders(final Map<String, String> headerMap) {
+        final HttpHeaders headers = new HttpHeaders();
+        headerMap.forEach(headers::add);
+        return headers;
     }
 
     private MultiValueMap<String, String> getBody(final String username,
@@ -206,6 +216,7 @@ public class HubConcurController {
         logger.debug("fetchCards called: baseUrl={}, routingPrefix={}, userEmail={}", baseUrl, routingPrefix, userEmail);
 
         return fetchLoginIdFromUserEmail(userEmail, baseUrl, connectorAuth)
+                .switchIfEmpty(Mono.error(new UserNotFoundException("User with email id " + userEmail + " is not found.")))
                 .flatMapMany(loginId -> fetchAllApprovals(baseUrl, loginId, connectorAuth))
                 .flatMap(expense -> fetchRequestData(baseUrl, expense.getId(), connectorAuth))
                 .map(report -> makeCards(baseUrl, routingPrefix, locale, report))
@@ -494,6 +505,7 @@ public class HubConcurController {
         String concurRequestTemplate = getConcurRequestTemplate(reason, action);
 
         return fetchLoginIdFromUserEmail(userEmail, baseUrl, connectorAuth)
+                .switchIfEmpty(Mono.error(new UserNotFoundException("User with email id " + userEmail + " is not found.")))
                 .flatMapMany(loginId -> validateUser(baseUrl, reportId, loginId, connectorAuth))
                 .flatMap(ignored -> fetchRequestData(baseUrl, reportId, connectorAuth))
                 .map(ExpenseReportResponse::getWorkflowActionURL)
@@ -534,7 +546,7 @@ public class HubConcurController {
                 .filter(expense -> expense.getId().equals(reportId))
                 .filter(expense -> expense.getApproverLoginID().equals(loginID))
                 .next()
-                .switchIfEmpty(Mono.error(new UserException("Not Found"))); // CustomException
+                .switchIfEmpty(Mono.error(new UserNotFoundException("User with login id " + loginID + " is not found."))); // CustomException
     }
 
     @PostMapping(
@@ -628,7 +640,14 @@ public class HubConcurController {
     @ResponseStatus(NOT_FOUND)
     @ResponseBody
     public Map<String, String> handleAttachmentURLNotFoundException(AttachmentURLNotFoundException e) {
-        return Map.of("message", e.getMessage());
+        return Map.of("error", e.getMessage());
+    }
+
+    @ExceptionHandler(UserNotFoundException.class)
+    @ResponseStatus(NOT_FOUND)
+    @ResponseBody
+    public Map<String, String> handleUserNotFoundException(UserNotFoundException e) {
+        return Map.of("error", e.getMessage());
     }
 
     @ExceptionHandler(InvalidServiceAccountCredentialException.class)
@@ -636,6 +655,6 @@ public class HubConcurController {
     public ResponseEntity<Map<String, String>> handleInvalidServiceAccountCredentialException(InvalidServiceAccountCredentialException e) {
         return ResponseEntity.status(BAD_REQUEST)
                 .header(BACKEND_STATUS, Integer.toString(UNAUTHORIZED.value()))
-                .body(Map.of("message", e.getMessage()));
+                .body(Map.of("error", e.getMessage()));
     }
 }

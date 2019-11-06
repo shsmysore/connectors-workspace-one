@@ -11,6 +11,7 @@ import com.vmware.connectors.common.payloads.response.*;
 import com.vmware.connectors.common.utils.AuthUtil;
 import com.vmware.connectors.common.utils.CardTextAccessor;
 import com.vmware.connectors.common.utils.Reactive;
+import com.vmware.connectors.common.web.InvalidConfigParamException;
 import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -209,7 +210,7 @@ public class HubSalesForceController {
         }
 
         return retrieveOpportunities(baseUrl, opportunityIds, connectorAuth, configParams)
-                .flatMapMany(opportunityResponse -> buildCards(workItemResponse, opportunityResponse, locale, routingPrefix, configParams));
+                .flatMapMany(opportunityResponse -> buildCards(baseUrl, workItemResponse, opportunityResponse, locale, routingPrefix, configParams));
     }
 
     private Mono<JsonDocument> retrieveOpportunities(final String baseUrl,
@@ -228,7 +229,8 @@ public class HubSalesForceController {
                 .bodyToMono(JsonDocument.class);
     }
 
-    private Flux<Card> buildCards(final JsonDocument workItemResponse,
+    private Flux<Card> buildCards(final String baseUrl,
+                                  final JsonDocument workItemResponse,
                                   final JsonDocument opportunityResponse,
                                   final Locale locale,
                                   final String routingPrefix,
@@ -249,7 +251,18 @@ public class HubSalesForceController {
             final Card.Builder card = new Card.Builder()
                     .setName("Salesforce for WS1 Hub")
                     .setTemplate(routingPrefix + "templates/generic.hbs")
-                    .setHeader(this.cardTextAccessor.getMessage("ws1.sf.card.header", locale))
+                    .setHeader(
+                            new CardHeader(
+                                    this.cardTextAccessor.getMessage("ws1.sf.card.header", locale),
+                                    null,
+                                    new CardHeaderLinks(
+                                            fromUriString(baseUrl)
+                                                    .path(opportunityId)
+                                                    .toUriString(),
+                                            null
+                                    )
+                            )
+                    )
                     .setBody(buildCardBody(opportunityResponse, i, locale, configParams))
                     .setBackendId(opportunityId)
                     .addAction(buildApproveAction(routingPrefix, locale, userId))
@@ -372,10 +385,4 @@ public class HubSalesForceController {
         return value.replace("\\", "\\\\").replace("\'", "\\\'");
     }
 
-    @ExceptionHandler(InvalidConfigParamException.class)
-    @ResponseStatus(HttpStatus.BAD_REQUEST)
-    @ResponseBody
-    public Map<String, String> handleInvalidConnectorConfigError(InvalidConfigParamException e) {
-        return Map.of("message", e.getMessage());
-    }
 }

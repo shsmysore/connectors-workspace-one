@@ -10,6 +10,11 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.springframework.test.context.TestPropertySource;
 
+import java.io.IOException;
+
+import static com.vmware.connectors.common.utils.CommonUtils.BACKEND_STATUS;
+import static org.springframework.http.MediaType.APPLICATION_JSON;
+
 /**
  * Test cases with empty concur service account auth header from configuration.
  */
@@ -46,16 +51,6 @@ class HubConcurOotbTest extends HubConcurControllerTestBase {
     void testApprovedReqWithMissingAuthHeader() {
         approveRequest("")
                 .expectStatus().isBadRequest();
-    }
-
-    @Test
-    void testUnauthorizedApproveRequest() throws Exception {
-        // User tries to approve an expense report that isn't theirs
-        mockOAuthToken(CALLER_SERVICE_CREDS);
-        mockEmptyReportsDigest(EXPECTED_AUTH_HEADER);
-
-        approveRequest(CALLER_SERVICE_CREDS)
-                .expectStatus().isNotFound();
     }
 
     @Test
@@ -156,5 +151,76 @@ class HubConcurOotbTest extends HubConcurControllerTestBase {
     @Test
     void testUnauthorizedServiceAccountCredential() {
         unauthorizedServiceAccountCredential();
+    }
+
+    @Test
+    void testCardReqWhenUserNotFound() throws Exception {
+        mockOAuthToken(CALLER_SERVICE_CREDS);
+        mockInvalidUserDetails("fake/empty-user-details.json");
+
+        cardsRequest("", CALLER_SERVICE_CREDS)
+                .expectStatus().isNotFound()
+                .expectBody().json(fromFile("connector/responses/user_email_not_found.json"));
+    }
+
+    @Test
+    void testCardReqWithEmptyApprovals() throws Exception {
+        mockOAuthToken(CALLER_SERVICE_CREDS);
+        mockEmptyReportsDigest(EXPECTED_AUTH_HEADER);
+
+        cardsRequest("", CALLER_SERVICE_CREDS)
+                .expectStatus().isOk()
+                .expectHeader().contentTypeCompatibleWith(APPLICATION_JSON)
+                .expectBody().json(fromFile("connector/responses/empty_response.json"));
+    }
+
+    @Test
+    void testApproveWhenUserNotFound() throws IOException {
+        mockOAuthToken(CALLER_SERVICE_CREDS);
+        mockInvalidUserDetails("fake/empty-user-details.json");
+
+        approveRequest(CALLER_SERVICE_CREDS)
+                .expectStatus().isNotFound()
+                .expectBody().json(fromFile("connector/responses/user_email_not_found.json"));
+    }
+
+    @Test
+    void testApproveForAnInvalidUser() throws Exception {
+        mockOAuthToken(CALLER_SERVICE_CREDS);
+        mockUserDetailReport(EXPECTED_AUTH_HEADER, "/fake/invalid-user-details.json");
+        mockReportsDigest(EXPECTED_AUTH_HEADER, "invalid%40acme.com");
+
+        approveRequest(CALLER_SERVICE_CREDS)
+                .expectStatus().isNotFound();
+    }
+
+    @Test
+    void testRejectWhenUserNotFound() throws IOException {
+        mockOAuthToken(CALLER_SERVICE_CREDS);
+        mockInvalidUserDetails("fake/empty-user-details.json");
+
+        rejectRequest(CALLER_SERVICE_CREDS)
+                .expectStatus().isNotFound()
+                .expectBody().json(fromFile("connector/responses/user_email_not_found.json"));
+    }
+
+    @Test
+    void testRejectForAnInvalidUser() throws Exception {
+        mockOAuthToken(CALLER_SERVICE_CREDS);
+        mockUserDetailReport(EXPECTED_AUTH_HEADER, "/fake/invalid-user-details.json");
+        mockReportsDigest(EXPECTED_AUTH_HEADER, "invalid%40acme.com");
+
+        rejectRequest(CALLER_SERVICE_CREDS)
+                .expectStatus().isNotFound()
+                .expectBody().json(fromFile("connector/responses/user_login_not_found.json"));
+    }
+
+    @Test
+    void testForbiddenException() throws Exception {
+        mockOAuthForbiddenException(CALLER_SERVICE_CREDS);
+
+        cardsRequest("", CALLER_SERVICE_CREDS)
+                .expectStatus().isBadRequest()
+                .expectHeader().valueEquals(BACKEND_STATUS, "401");
     }
 }
